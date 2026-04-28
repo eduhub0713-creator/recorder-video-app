@@ -1,9 +1,9 @@
 import React, { useEffect, useRef, useState } from "react";
+import { collection, addDoc, getDocs, updateDoc, doc, orderBy, query } from "firebase/firestore";
+import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
+import { db, storage } from "./firebase.js";
 
-const DB_NAME = "recorder-video-db";
-const STORE_NAME = "videos";
 const SPEEDS = [1, 1.25, 1.5, 1.75, 2, 2.25, 2.5, 2.75, 3];
-const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || "http://localhost:5000";
 
 export default function App() {
   const [recording, setRecording] = useState(false);
@@ -12,6 +12,7 @@ export default function App() {
   const [currentVideo, setCurrentVideo] = useState(null);
   const [speed, setSpeed] = useState(1);
   const [mediaRecorder, setMediaRecorder] = useState(null);
+  const [uploading, setUploading] = useState(false);
 
   const chunksRef = useRef([]);
   const videoRef = useRef(null);
@@ -33,62 +34,16 @@ export default function App() {
     return () => clearInterval(timerRef.current);
   }, [recording]);
 
-  const openDB = () => {
-    return new Promise((resolve, reject) => {
-      const request = indexedDB.open(DB_NAME, 1);
-
-      request.onupgradeneeded = () => {
-        const db = request.result;
-        if (!db.objectStoreNames.contains(STORE_NAME)) {
-          db.createObjectStore(STORE_NAME, { keyPath: "id" });
-        }
-      };
-
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error);
-    });
-  };
-
-  const cleanVideoForDB = (video) => {
-    const { url, ...safeVideo } = video;
-    return safeVideo;
-  };
-
-  const saveVideo = async (video) => {
-    const db = await openDB();
-
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE_NAME, "readwrite");
-      tx.objectStore(STORE_NAME).put(cleanVideoForDB(video));
-
-      tx.oncomplete = async () => {
-        await loadVideos();
-        resolve();
-      };
-
-      tx.onerror = () => reject(tx.error);
-    });
-  };
-
   const loadVideos = async () => {
-    const db = await openDB();
+    const q = query(collection(db, "videos"), orderBy("createdAt", "desc"));
+    const snapshot = await getDocs(q);
 
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE_NAME, "readonly");
-      const request = tx.objectStore(STORE_NAME).getAll();
+    const loadedVideos = snapshot.docs.map((item) => ({
+      id: item.id,
+      ...item.data(),
+    }));
 
-      request.onsuccess = () => {
-        const savedVideos = request.result.map((video) => ({
-          ...video,
-          url: URL.createObjectURL(video.blob),
-        }));
-
-        setVideos(savedVideos.reverse());
-        resolve();
-      };
-
-      request.onerror = () => reject(request.error);
-    });
+    setVideos(loadedVideos);
   };
 
   const startRecording = async () => {
@@ -108,36 +63,32 @@ export default function App() {
       };
 
       recorder.onstop = async () => {
-        const blob = new Blob(chunksRef.current, { type: "video/webm" });
-
-        let shareUrl = "";
+        setUploading(true);
 
         try {
-          const formData = new FormData();
-          formData.append("video", blob, "recording.webm");
+          const blob = new Blob(chunksRef.current, { type: "video/webm" });
+          const videoId = Date.now().toString();
+          const storageRef = ref(storage, `videos/${videoId}.webm`);
 
-          const response = await fetch(`${BACKEND_URL}/upload`, {
-            method: "POST",
-            body: formData,
+          await uploadBytes(storageRef, blob);
+          const videoUrl = await getDownloadURL(storageRef);
+
+          await addDoc(collection(db, "videos"), {
+            name: `Recording ${new Date().toLocaleString()}`,
+            category: "Uncategorized",
+            videoUrl,
+            createdAt: Date.now(),
           });
 
-          const data = await response.json();
-          shareUrl = data.url;
+          await loadVideos();
         } catch (error) {
-          alert("Video saved inside app, but backend upload failed.");
+          alert("Upload failed. Check Firebase Storage and Firestore rules.");
+          console.error(error);
         }
-
-        await saveVideo({
-          id: Date.now().toString(),
-          name: `Recording ${new Date().toLocaleString()}`,
-          category: "Uncategorized",
-          blob,
-          shareUrl,
-          createdAt: new Date().toISOString(),
-        });
 
         chunksRef.current = [];
         setRecordTime(0);
+        setUploading(false);
       };
 
       recorder.start();
@@ -184,23 +135,10 @@ export default function App() {
       skipVideo(side === "left" ? -5 : 5);
       return;
     }
-  
+
     tapRef.current = setTimeout(() => {
       tapRef.current = null;
     }, 280);
-  };
-
-  const openFullscreen = () => {
-    const video = videoRef.current;
-    if (!video) return;
-
-    if (video.requestFullscreen) {
-      video.requestFullscreen();
-    } else if (video.webkitRequestFullscreen) {
-      video.webkitRequestFullscreen();
-    } else if (video.msRequestFullscreen) {
-      video.msRequestFullscreen();
-    }
   };
 
   const changeSpeed = (newSpeed) => {
@@ -211,41 +149,41 @@ export default function App() {
     }
   };
 
-  const renameVideo = async (video, newName) => {
-    const updatedVideo = { ...video, name: newName };
+  const openFullscreen = () => {
+    const video = videoRef.current;
+    if (!video) return;
 
+    if (video.requestFullscreen) {
+      video.requestFullscreen();
+    }
+  };
+
+  const renameVideo = async (video, newName) => {
     setVideos((oldVideos) =>
-      oldVideos.map((item) => (item.id === video.id ? updatedVideo : item))
+      oldVideos.map((item) =>
+        item.id === video.id ? { ...item, name: newName } : item
+      )
     );
 
-    if (currentVideo?.id === video.id) {
-      setCurrentVideo(updatedVideo);
-    }
-
-    await saveVideo(updatedVideo);
+    await updateDoc(doc(db, "videos", video.id), {
+      name: newName,
+    });
   };
 
   const changeCategory = async (video, newCategory) => {
-    const updatedVideo = { ...video, category: newCategory };
-
     setVideos((oldVideos) =>
-      oldVideos.map((item) => (item.id === video.id ? updatedVideo : item))
+      oldVideos.map((item) =>
+        item.id === video.id ? { ...item, category: newCategory } : item
+      )
     );
 
-    if (currentVideo?.id === video.id) {
-      setCurrentVideo(updatedVideo);
-    }
-
-    await saveVideo(updatedVideo);
+    await updateDoc(doc(db, "videos", video.id), {
+      category: newCategory,
+    });
   };
 
   const copyVideoLink = async (video) => {
-    if (!video.shareUrl) {
-      alert("This video does not have an uploaded link yet.");
-      return;
-    }
-
-    await navigator.clipboard.writeText(video.shareUrl);
+    await navigator.clipboard.writeText(video.videoUrl);
     alert("Video link copied.");
   };
 
@@ -290,8 +228,8 @@ export default function App() {
       <h1>Recorder App</h1>
 
       {!recording ? (
-        <button className="start-btn" onClick={startRecording}>
-          ▶ Start Recording
+        <button className="start-btn" onClick={startRecording} disabled={uploading}>
+          {uploading ? "Uploading..." : "▶ Start Recording"}
         </button>
       ) : (
         <div className="recording-box">
@@ -305,12 +243,14 @@ export default function App() {
         </div>
       )}
 
+      {uploading && <p>Uploading video to Firebase...</p>}
+
       <h2>Saved Videos</h2>
 
       <div className="video-grid">
         {videos.map((video) => (
           <div className="video-card" key={video.id}>
-            <video src={video.url} className="thumb" muted />
+            <video src={video.videoUrl} className="thumb" muted />
 
             <input
               value={video.name}
@@ -342,7 +282,7 @@ export default function App() {
           <h2>{currentVideo.name}</h2>
 
           <div className="player-wrap">
-            <video ref={videoRef} src={currentVideo.url} className="main-video" />
+            <video ref={videoRef} src={currentVideo.videoUrl} className="main-video" />
 
             <button
               className="tap-zone tap-left"
@@ -380,8 +320,8 @@ export default function App() {
           </div>
 
           <p className="hint">
-            Mobile: single tap center = play/pause, double tap left/right = 5s.
-            PC: Space = play/pause, ← / → = 5s.
+            Mobile: center tap = play/pause, double tap left/right = 5s. PC:
+            Space = play/pause, ← / → = 5s.
           </p>
         </div>
       )}
