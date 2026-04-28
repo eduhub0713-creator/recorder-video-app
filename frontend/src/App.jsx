@@ -68,10 +68,20 @@ export default function App() {
         try {
           const blob = new Blob(chunksRef.current, { type: "video/webm" });
           const videoId = Date.now().toString();
-          const storageRef = ref(storage, `videos/${videoId}.webm`);
+          const formData = new FormData();
+          formData.append("file", blob);
+          formData.append("upload_preset", "recorder_upload");
 
-          await uploadBytes(storageRef, blob);
-          const videoUrl = await getDownloadURL(storageRef);
+          const response = await fetch(
+            "https://api.cloudinary.com/v1_1/dcn14gdyc/video/upload",
+            {
+              method: "POST",
+              body: formData,
+            }
+          );
+
+          const data = await response.json();
+          const videoUrl = data.secure_url;
 
           await addDoc(collection(db, "videos"), {
             name: `Recording ${new Date().toLocaleString()}`,
